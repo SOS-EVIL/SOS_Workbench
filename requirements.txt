@@ -1,2 +1,2 @@
-openai>=1.0
+openai>=3.37.0
 cryptography>=41.0
