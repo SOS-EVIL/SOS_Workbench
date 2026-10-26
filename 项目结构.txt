@@ -1,0 +1,164 @@
+SOS_Workbench 0.1.0 项目结构
+
+    带 ★ 的模块是平台内核。ui/ 只是内核的一个客户端。
+    工具与技能通过"进程契约"接入，与平台没有 import 关系。
+
+
+======================================================================
+一、目录总览
+======================================================================
+SOS_Workbench/
+├── main.py                     入口：创建 Tk 根窗口、注入密钥管理器、启动应用
+├── app.py                      主应用：UI 组装、项目/目标管理、日志路由、AI 调度协调
+├── cli.py                      无 GUI CLI：计划/执行/run 记录/证据包（给 DSH 的入口）
+├── sos_workbench.cmd           Windows CLI 包装器
+├── README.md                   定位与使用（GitHub 入口）
+├── LICENSE                     MIT
+├── SECURITY.md                 安全问题与信任边界
+├── CONTRIBUTING.md             开发与提交规范
+├── CODE_OF_CONDUCT.md          行为准则
+├── .gitattributes              换行统一
+├── .github/workflows/test.yml  CI：契约测试 + 编排集成测试 + 继承测试
+├── .github/workflows/release.yml  tag 发布：测试 + 源码 zip + Release
+├── .github/ISSUE_TEMPLATE/      Issue 模板
+├── .github/PULL_REQUEST_TEMPLATE.md
+├── .github/dependabot.yml      依赖更新
+├── docs/                       发布截图（最大化窗口）
+│   ├── README.md               截图说明
+│   ├── CLI.md                  CLI 命令、计划格式、run 记录与证据包
+│   └── RELEASE.md              发布检查、tag、源码包与截图要求
+├── CHANGELOG.md                版本变更记录
+├── 项目结构.txt                 本文件
+├── 对齐方法.txt                 工具/技能接入契约（写工具前必读）
+├── 递归标准.txt                 父子任务嵌套契约与状态机
+├── 轮次skill规则.txt             二级技能模板与生命周期
+├── 日志结构.txt                 日志分层与落盘位置
+├── requirements.txt            Python 依赖
+├── .gitignore                  排除运行数据、凭据、缓存
+│
+├── config/
+│   ├── tools.py                工具目录、可执行后缀、并发/超时、默认安全开关、数据目录
+│   ├── version.py              单一版本来源
+│   └── models.py               ★ 模型清单与 API 端点（接其它厂商改这里）
+│
+├── core/
+│   ├── targets.py          ★   target 抽象：parse / slug / alias / normalize_input / 凭证
+│   ├── tool_runner.py      ★   子进程：按后缀启动（py/exe/bat/cmd/ps1/sh/js）、流式日志、超时/取消/进程树强杀
+│   ├── task_executor.py    ★   调度：并发闸门、run_id 精确终止、超时透传
+│   ├── tool_registry.py    ★   工具发现 + 参数能力探测（源码 / manifest / 契约默认）
+│   ├── log_writer.py       ★   session.log 异步写入（有界缓冲）
+│   ├── headless.py             CLI/测试用无 GUI 宿主（Phase2 适配）
+│   ├── structured_logger.py    JSONL 结构化日志
+│   ├── agent_orchestrator.py   AI 编排：技能加载、意图识别、动作注册
+│   ├── deepseek_client.py      OpenAI 兼容客户端
+│   ├── api_key_manager.py      API Key 加密存储（Fernet）
+│   ├── shell_executor.py       临时命令执行（供模型动作调用）
+│   └── skill/
+│       ├── base_skill.py       技能基类：生命周期、日志缓冲、快照节流
+│       └── skill_toolbox.py    技能沙箱：UI 输出、工具调用、跨技能内存
+│
+├── phases/
+│   ├── phase1.py               L1 执行台：单工具执行入口
+│   ├── phase2.py               L2 编排台：步骤链、参数继承、轮次汇总、嵌套调用
+│   └── phase3.py               L3 会话管理：聊天日志、死亡标记、轮次摘要读取
+│
+├── ui/
+│   ├── custom_tab.py           可横向滚动的标签栏
+│   ├── main_panel.py           主界面：全局日志、汇总、综合研判
+│   ├── target_panel.py         单目标面板：控制按钮 + 双日志框
+│   ├── freedom_task_panel.py   L2 编排面板：步骤盒、参数、继承、轮次
+│   └── phase3_task_panel.py    L3 手动决策面板
+│
+├── external_tools/             用户工具区（可放任意语言的可执行文件）
+│   ├── sqlite_query.py         示例：只读 SQLite 查询
+│   └── http_probe.py           示例：只读 HTTP 探测（GET/HEAD）
+│
+├── skills/
+│   └── phase3/
+│       └── chat_bot.py         示例技能：三级面板的对话入口
+│
+├── test/
+│   ├── conformance.py          契约一致性测试
+│   ├── integration_phase2.py   编排集成测试
+│   ├── inheritance.py          inherit_from 继承回归测试
+│   ├── cli_smoke.py            CLI 端到端冒烟
+│   └── cli_advanced.py         async/scope/审批/证据链/入库测试
+│
+├── reports/                    工具产物（可为空）
+├── storage/                    运行数据（可整体删除，程序会重建）
+│   ├── projects/{项目}/
+│   │   ├── assets.json         目标清单
+│   │   ├── session.log         全局文本日志
+│   │   ├── latest/{slug}/round_N/{工具}_{序号}.json
+│   │   └── structured_logs/{slug}/{工具}.jsonl
+│   ├── round/{任务}/{任务}_round_N.json
+│   ├── runs/{run_id}/run.json  CLI run 记录（计划/hash/审批/证据链）
+│   ├── staging/{tool,skill}/{name}/manifest.json  待审核产物
+│   ├── tools/                  审核通过的托管工具
+│   ├── skills/{category}/       审核通过的托管技能
+│   ├── phase3/{任务}/config.json、chat_log.json
+│   └── model_config.json
+│
+└── utils/
+    └── log_utils.py            ANSI 清洗、时间戳
+
+
+======================================================================
+二、一次任务的调用链
+======================================================================
+L2 面板点「开始」
+    → app._on_freedom_toggle
+    → phase2.run_task(task_id, panel, target)
+        → 线程 _execute_tool_chain，每一步：
+            _parse_parameters        解析参数 JSON、继承上游结果/文件
+            targets.redact           先生成脱敏副本（给日志）
+            targets.resolve_secrets  再解析凭证（给执行）
+            _step_timeout            计算进程超时
+            _run_single_tool / _run_freedom_atomic / _run_skill
+                → task_executor.submit        并发闸门 + run_id 登记
+                    → tool_runner.run         Popen、流式读、看门狗
+                        → 子进程（任意语言）
+            _save_round_summary     写 storage/round/{任务}/{任务}_round_N.json
+            panel.advance_round()   轮次 +1
+
+CLI 调用链（无 GUI）
+    → cli.py run
+    → core/headless.HeadlessApp / HeadlessPanel
+    → phase2.run_task / _execute_tool_chain    与 GUI 完全同一套执行核
+    → storage/runs/{run_id}/run.json           CLI 额外写 run 记录
+
+L3 只读消费：phase3.get_round_log / get_round_summary_text
+
+
+======================================================================
+三、依赖方向
+======================================================================
+    ui/ ──▶ app.py ──▶ phases/ ──▶ core/
+     ▲         │
+     └──回调───┘
+
+    cli.py ──▶ core/headless.py ──▶ phases/ ──▶ core/
+
+    core 不 import tkinter（编排器里改为函数内延迟导入），
+    phases 不直接操作控件，
+    工具与平台之间只有进程契约。
+
+
+======================================================================
+四、会自动重建的东西
+======================================================================
+    storage/projects、storage/round、storage/phase3、storage/runs   启动时缺则创建
+    reports/                                          工具按需写入
+    session.log、latest/、structured_logs/             有执行才产生
+
+    删除 storage/ 不损坏程序，只丢历史记录。
+    SOS_DATA_DIR 可把整个运行数据根目录移到别处（CLI/测试隔离）。
+
+
+======================================================================
+五、接入新领域要动哪些文件
+======================================================================
+    1 个文件：external_tools/你的工具（任意语言）
+    0 处平台代码改动。
+
+    这是"执行器中立"的验收标准。

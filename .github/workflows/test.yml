@@ -1,0 +1,53 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip check
+
+      - name: Byte-compile
+        run: python -m compileall -q app.py main.py cli.py core phases config ui utils external_tools test skills
+
+      - name: Contract tests
+        run: python test/conformance.py
+
+      - name: Orchestration tests
+        run: python test/integration_phase2.py
+
+      - name: Inheritance tests
+        run: python test/inheritance.py
+
+      - name: CLI smoke tests
+        run: python test/cli_smoke.py
+
+      - name: CLI advanced tests
+        run: python test/cli_advanced.py

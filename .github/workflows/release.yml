@@ -1,0 +1,50 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip check
+
+      - name: Tests
+        run: |
+          python test/conformance.py
+          python test/integration_phase2.py
+          python test/inheritance.py
+          python test/cli_smoke.py
+          python test/cli_advanced.py
+
+      - name: Build source archive
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          git archive --format=zip --prefix="SOS_Workbench-$tag/" -o "SOS_Workbench-$tag.zip" $tag
+          Get-Item "SOS_Workbench-$tag.zip"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SOS_Workbench-*.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true

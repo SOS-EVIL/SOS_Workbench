@@ -1,0 +1,6 @@
+{
+  "args": ["--project-dir", "--target", "--host", "--config"],
+  "description": "只读 HTTP 探测示例（GET/HEAD）",
+  "risk": "read_only",
+  "version": "0.1.0"
+}

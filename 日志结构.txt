@@ -1,0 +1,140 @@
+SOS_Workbench 0.1.0 日志结构
+
+实例文件：core/log_writer.py            文本日志（session.log）
+          core/structured_logger.py     结构化日志（JSONL）
+平台实现：app.py                        日志路由（log_global / log_target / log_target_program）
+          phases/phase2.py              轮次快照与汇总
+
+    本文件描述**实际**的落盘位置与格式，不是设想。
+    三层日志互不依赖：界面显示、文本日志、结构化日志。
+
+
+======================================================================
+一、三层总览
+======================================================================
+层          组件                          作用                          是否落盘
+----------  ----------------------------  ----------------------------  --------
+界面实时    app.log_global/log_target/   给操作者看                   否
+            log_target_program
+文本日志    core/log_writer.LogWriter    全量混合文本，便于翻查        是
+结构化日志  core/structured_logger.py    按 target/工具 分文件的 JSONL 是
+轮次快照    phases/phase2.py             每轮每步的结果快照            是
+
+
+======================================================================
+二、落盘位置
+======================================================================
+storage/projects/{项目}/
+├── session.log                                  ← 文本日志（LogWriter 异步写）
+├── structured_logs/
+│   └── {slug}/
+│       ├── {工具名}.jsonl                         ← 该工具的 tool_start/output/end
+│       ├── {技能名}.jsonl                         ← 该技能的 skill_* 事件
+│       ├── _summary.jsonl                        ← scan_start / scan_end（预留）
+│       └── （无 host 的事件进 _global.jsonl）
+└── latest/
+    └── {slug}/
+        └── round_{N}/
+            ├── {工具名}_{序号}.json                ← 步骤级快照（工具）
+            └── {技能名}_{序号}.json                ← 步骤级快照（技能）
+
+storage/round/{任务名}/
+├── plan.json                                     ← 任务计划（步骤链）
+├── task_config.json                              ← 任务名 / 当前轮次 / 计划
+├── {任务名}_round_{N}.json                        ← 轮次汇总（**L3 读的就是这个**）
+└── ...
+
+storage/phase3/{任务名}/
+├── config.json                                   ← 技能名 / 关联 L2 任务 / 轮次
+└── chat_log.json                                 ← 对话历史（每条 fsync）
+
+storage/runs/{run_id}/run.json                    ← CLI run 记录（计划/hash/审批/证据链）
+storage/staging/{tool,skill}/{name}/manifest.json ← 待审核产物
+storage/tools/                                     ← 审核通过的托管工具
+storage/skills/{category}/                         ← 审核通过的托管技能
+
+{slug} 的生成规则见 core/targets.py：
+    纯域名  WWW.BAIDU.COM → WWW_BAIDU_COM（与 v5.x 目录名逐字符一致）
+    其它    D:\a\b.db      → D_a_b.db__1a2b3c4d（非法字符替换 + 8 位哈希后缀）
+
+
+======================================================================
+三、session.log（文本日志）
+======================================================================
+内容：log_global / log_target / log_target_program 的每一行，带时间戳。
+
+格式（本地时间，时:分:秒）：
+    [22:45:25] 已添加目标: file:demo/analytics.db
+    [22:45:25] [file:demo/analytics.db] 🚀 启动 sqlite_query ...
+
+写入方式：core/log_writer.LogWriter
+    · write() 只入队，不碰磁盘
+    · 后台线程每 2 秒批量 append 一次
+    · 缓冲区上限 20000 行，超出丢最旧（防止长期运行吃内存）
+    · 关闭程序时 close() 会做最后一次 flush
+    · 有独立的回归测试，覆盖"写入线程未启动"这一历史缺陷
+
+
+======================================================================
+四、structured_logs（JSONL）
+======================================================================
+每行一个 JSON 事件，追加写。
+
+    tool_start    {event, host, tool, args, ts}
+    tool_output   {event, host, tool, line, ts}
+    tool_end      {event, host, tool, status, duration, result_summary, ts}
+    skill_start   {event, host, skill, ts}
+    skill_output  {event, host, skill, line, ts}
+    skill_end     {event, host, skill, status, duration, result_summary, ts}
+    scan_start / scan_end      （预留，当前默认不产生）
+
+注意：事件里的 host 字段实际存放的是 target（历史命名）。
+
+
+======================================================================
+五、轮次快照与汇总
+======================================================================
+步骤级快照  latest/{slug}/round_N/{工具}_{序号}.json
+
+    {tool, host, status, round, task_name, exec_index,
+     start_time, end_time, duration, output_lines}
+
+轮次汇总（L3 的输入）  storage/round/{任务}/{任务}_round_N.json
+
+    {task_name, round, timestamp,
+     tools: { 工具名: [ {success, output, output_lines, duration, exec_index, ...}, ... ] }}
+
+    ★ 这份文件的**路径与字段格式是稳定契约**：
+      L3 的 phase3.get_round_log / get_round_summary_text 依赖它。
+      修改字段名会直接打断 L3，请勿轻动。
+
+
+======================================================================
+六、并发写安全性
+======================================================================
+    session.log         单写入线程 + 队列，天然串行
+    structured_logs     StructuredLogger 内部队列 + 单写线程 + 文件锁
+    轮次快照            文件名含 exec_index，同轮同工具多次执行不会互相覆盖
+    chat_log.json       每任务一把锁，读-改-写，fsync
+
+    已知限制：
+    · 同一 Skill 的多个运行共享一份实例状态（_log_buffer），不能并发
+    · chat_log.json 每次追加都重写整个文件（对话很长时会变慢，待优化）
+
+
+======================================================================
+七、CLI run 记录与证据包
+======================================================================
+    storage/runs/{run_id}/run.json
+
+    {schema:"sos.run/v1", run_id, status, mode, pid, task_name, round,
+     project_dir, target, plan, plan_hash, plan_version, parent_run_id,
+     actor, scope, scope_hash, budget, approvals, model_id, model_prompt_hash,
+     steps, summary_path, session_log, structured_logs,
+     tool_versions_start, tool_versions, tool_frozen,
+     skill_versions, skill_frozen, evidence_chain, evidence_root,
+     hash_algorithm, signature, log_tail, started_at, finished_at, duration}
+
+    python cli.py runs bundle --run-id <id> --out bundle.json
+      → {schema:"sos.run_bundle/v1", run, round_summary, artifacts}
+      → artifacts 含 summary、session.log、latest 快照、structured_logs 的 path/sha256/size

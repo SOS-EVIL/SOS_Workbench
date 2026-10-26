@@ -1,0 +1,391 @@
+SOS_Workbench 0.1.0 对齐方法（工具 / 技能接入契约）
+
+实例文件：external_tools/sqlite_query.py       工具契约示例（SQLite，Python）
+          external_tools/http_probe.py         工具契约示例（HTTP GET/HEAD，Python）
+          skills/phase3/chat_bot.py            技能契约完整示例
+平台实现：core/tool_runner.py                   命令构造与进程管理
+          core/tool_registry.py                 参数能力探测
+
+    目标读者：要往本平台接入新能力的人
+    一句话：平台只认"进程契约"，不认编程语言、不认领域。
+
+
+======================================================================
+零、先理解这件事
+======================================================================
+平台不会 import 你的代码，也不要求你继承任何类。
+它只是启动一个子进程，然后：
+
+    把你的 target 和 params 写进命令行
+    读你的 stderr，当作实时日志
+    读你的 stdout，从标记之间取出结构化结果
+    看你的退出码，判断成功还是失败
+
+所以你的工具可以是：
+    · 一个 Python 脚本（推荐，最省事）
+    · 任何能被命令行调起的东西（用一层几行的 python 包装器转接即可）
+
+
+======================================================================
+一、一次调用长什么样
+======================================================================
+平台实际执行的命令：
+
+    python <你的工具.py> --project-dir <项目目录> --target <target> [--config <json>]
+
+同时传入的环境变量：
+
+    TARGET=<target>
+    PROJECT_DIR=<项目目录>
+    RUN_ID=<本次运行标识，可用于你自己的日志关联>
+    PYTHONUNBUFFERED=1
+
+工作目录（cwd）设置为项目目录。
+
+重要：平台会**先探测你的工具声明了哪些参数**，然后只下传你声明过的：
+
+    你声明了 --target   → 收到 --target
+    你只声明了 --host   → 收到 --host（不会塞 --target，避免 argparse 报错）
+    你声明了 --config   → 收到 --config <json>
+    你声明了 --mode     → params 里的 "mode" 会变成 --mode <值>
+
+
+======================================================================
+一（续） 非 Python 工具（同一契约，无需适配层）
+======================================================================
+平台按后缀决定启动方式，参数规则完全一致：
+
+    .py / .pyz     python <file> ...
+    .exe           直接执行
+    .bat / .cmd    cmd /c <file> ...
+    .ps1          powershell -NoProfile -ExecutionPolicy Bypass -File <file> ...
+    .sh           bash <file> ...（无 bash 时退回 sh）
+    .js           node <file> ...
+
+非 Python 工具无法解析源码，平台默认按**完整契约**下传：
+
+    --project-dir <dir>   --target <target>   --config <json>
+
+示例 A：Windows 批处理  external_tools/hello.bat
+
+    @echo off
+    set T=
+    :loop
+    if "%~1"=="" goto done
+    if /I "%~1"=="--target" (set T=%~2& shift& shift& goto loop)
+    shift
+    goto loop
+    :done
+    echo [hello] target=%T% >&2
+    echo __JSON_RESULT_START__
+    echo {"success": true, "target": "%T%"}
+    echo __JSON_RESULT_END__
+
+示例 B：Node  external_tools/hello.js
+
+    const a = process.argv.slice(2);
+    const i = a.indexOf("--target");
+    const t = i >= 0 ? a[i + 1] : "";
+    console.error(`[hello] target=${t}`);
+    console.log("__JSON_RESULT_START__");
+    console.log(JSON.stringify({ success: true, target: t }));
+    console.log("__JSON_RESULT_END__");
+
+自定义参数名：在同目录放一个同名 .json
+
+    hello.json
+    {"args": ["--project-dir", "--target", "--config"],
+     "description": "hello world 示例"}
+
+    manifest 的 args 会覆盖源码探测结果，但**必须保留 --target 或 --host**，
+    否则平台没有地方传 target；--project-dir / --config 去掉就不传。
+
+
+======================================================================
+二、参数传递的三级规则
+======================================================================
+规则 1（首选）：声明 --config，收整个 JSON
+
+    params  {"sql": "select 1", "limit": 50}
+    argv    --config '{"sql": "select 1", "limit": 50}'
+    工具侧   json.loads(args.config)
+
+规则 2（兼容旧工具）：不声明 --config，按同名键映射
+
+    params  {"mode": "deep", "ports": "80,443"}
+    argv    --mode deep --ports 80,443
+    条件    params 的键 k 必须能映射到你声明的 --k（下划线自动转连字符）
+    布尔    True → 只加开关；False → 不加
+    跳过    dict / list 类型的值（这类值必须走规则 1）
+    内置键  --project-dir / --target / --host 不参与映射
+
+规则 3：未识别的键
+
+    平台在日志里告警"不认识这些参数键，已忽略"，不会报错、不会中断。
+    所以：宁可多传键，不要少传。
+
+
+======================================================================
+三、输出规范（这是契约的核心）
+======================================================================
+
+【日志】一律写 stderr，逐行，立即 flush
+
+    import sys
+    def log(msg):
+        print(f"  {msg}", file=sys.stderr)
+        sys.stderr.flush()
+
+    · 平台会把它实时显示到界面，并写入日志文件
+    · 单行建议 < 300 字符，过长的行会被截断显示（结构化结果不受影响）
+    · 不要用 \r 做进度条（会变成大量碎片行）
+
+【结果】写 stdout，用固定标记包起来
+
+    print("__JSON_RESULT_START__")
+    print(json.dumps(result, ensure_ascii=False, default=str))
+    print("__JSON_RESULT_END__")
+    sys.stdout.flush()
+
+    · 标记必须各占一整行
+    · 中间必须是**单个** JSON 对象（不能是数组、不能多段）
+    · 建议字段：success / target / elapsed，其余随你
+    · stdout 里不要混入普通 print（会污染解析），要打印就打到 stderr
+
+【失败】两种方式，任选
+
+    方式 A  退出码非 0（最简单）
+    方式 B  在 stdout 或 stderr 里输出一行 "__ERROR__:原因"
+            平台会把该步标记为 failed，并保留这一行作为失败原因
+
+    ★ 即使失败，也建议照样输出一次 JSON 结果（success=false），
+      这样轮次快照里仍然有该步的完整记录。
+
+
+======================================================================
+四、target 的使用原则
+======================================================================
+1. target 是一个**不透明字符串**，平台原样传给你，不做任何加工。
+
+2. 不要在工具里硬拼协议头/路径。target 可能就是完整的：
+       postgresql://user@host:5432/db
+       D:\data\2026\app.db
+       https://example.com/path
+
+   如果你需要支持简写（例如把 example.com 补成 https://example.com），
+   那是**你的工具**的职责，写在你的工具里，别指望平台。
+
+3. 落盘文件名不要自己用 target 拼。平台会用安全派生名（slug）落盘：
+       纯域名     WWW.BAIDU.COM        → WWW_BAIDU_COM
+       其它       D:\a\b.db            → D_a_b.db__1a2b3c4d  （带哈希后缀）
+   你的工具如果需要写文件，请写到 --project-dir 下，文件名自己保证合法。
+
+4. 如果 target 可以带类型前缀（db: / file: / etl:），
+   平台会保留它，你的工具可以自行剥离：
+       if target.lower().startswith("db:"): target = target[3:]
+
+
+======================================================================
+五、凭证：不要自己读明文
+======================================================================
+在 L2 的参数框里写：
+
+    {"dsn": "postgresql://app@db:5432/prod",
+     "password": {"$secret": "DB_PASS"}}
+
+平台在**执行前**把它替换成环境变量 DB_PASS 的值，再传给你的工具。
+日志、快照、AI 上下文里只会出现 {"$secret":"DB_PASS","value":"***"}。
+
+    · 所以你的工具正常读 args.config 就行，收到的已经是明文
+    · 环境变量缺失时该步直接失败，不会把 None 传给你
+    · 不要在工具里再打印 config（你打印的话，明文会进日志）
+    · 更不要在工具里把它写进自己的日志文件
+
+
+======================================================================
+六、超时与取消
+======================================================================
+    · 平台默认给单步 900 秒（config/tools.py → DEFAULT_STEP_TIMEOUT）
+    · 步骤参数里写 "timeout": 1200 → 进程超时 1200+30 秒
+    · 超时/取消时，平台会强杀**整个进程树**（Windows: taskkill /T）
+
+对你的影响：
+    1. 你的工具如果会再起子进程，它们会跟着一起被杀，不用自己清理
+    2. 长任务请定期往 stderr 输出一行心跳，否则：
+       · 界面上看不到进展（看起来像卡死）
+       · "暂停"是**行粒度**的，没有输出就没法暂停
+    3. 收到强杀时不会给你收尾机会。需要落盘中间状态的，自己定期写。
+
+
+======================================================================
+七、最小工具模板（复制即用）
+======================================================================
+保存为 external_tools/my_tool.py，重启程序即可在 L2 面板看到。
+
+    #!/usr/bin/env python3
+    """my_tool.py - 最小合规工具"""
+    import argparse, json, sys
+
+    def log(msg):
+        print(f"  {msg}", file=sys.stderr)
+        sys.stderr.flush()
+
+    def emit(payload):
+        print("__JSON_RESULT_START__")
+        print(json.dumps(payload, ensure_ascii=False, default=str))
+        print("__JSON_RESULT_END__")
+        sys.stdout.flush()
+
+    def main():
+        p = argparse.ArgumentParser()
+        p.add_argument("--project-dir", required=True)   # 平台约定
+        p.add_argument("--target", default="")           # 新契约
+        p.add_argument("--host", default="")             # 旧别名（兼容）
+        p.add_argument("--config", default="{}")         # 参数
+        a = p.parse_args()
+
+        target = (a.target or a.host or "").strip()
+        try:
+            params = json.loads(a.config or "{}")
+        except json.JSONDecodeError:
+            params = {}
+
+        log(f"[my_tool] target={target}")
+        log(f"[my_tool] params={list(params.keys())}")
+
+        if not target:
+            log("[ERROR] target 为空")
+            print("__ERROR__:target 为空")
+            emit({"success": False, "error": "target 为空"})
+            return 1
+
+        try:
+            # ---- 你的业务逻辑 ----
+            result = {"success": True, "target": target, "echo": params}
+            log("[my_tool] 完成")
+            emit(result)
+            return 0
+        except Exception as e:
+            log(f"[ERROR] {type(e).__name__}: {e}")
+            print(f"__ERROR__:{e}")
+            emit({"success": False, "error": str(e)})
+            return 1
+
+    if __name__ == "__main__":
+        sys.exit(main())
+
+
+======================================================================
+八、接入自检清单
+======================================================================
+□ 文件放在 external_tools/ 下，文件名 = 你想在界面里看到的工具名
+□ python 你的工具.py --help 能看到 --project-dir / --target / --config
+□ 手动跑一次能不报错退出：
+      python external_tools/你的工具.py --project-dir . --target 测试值 --config "{}"
+□ 日志都走 stderr，且每行 flush
+□ 结果被 __JSON_RESULT_START__ / __JSON_RESULT_END__ 包住，且是单个 JSON 对象
+□ 退出码：成功 0，失败非 0
+□ 不读 stdin（会永久阻塞）
+□ 参数 JSON 里的凭证用 {"$secret": "..."}，且工具自己不打印它
+□ 长任务有心跳输出
+
+
+======================================================================
+九、常见坑
+======================================================================
+1. 只声明 --host 却在代码里读 args.target
+   → 平台按你声明的下传，没有 --target 时 args.target 不存在（AttributeError）。
+   要么两边都声明，要么只读 --host。
+
+2. 把日志 print 到 stdout
+   → 会混进结果区；虽然标记还在，但排障时很难看。日志一律 stderr。
+
+3. print 之后不 flush
+   → Python 在管道模式下会缓冲，界面表现为"跑完才出日志"。
+   每个 log() 里加 sys.stderr.flush()。
+
+4. 声明了 --config 但忘记 json.loads
+   → 拿到的是字符串，不是字典。
+
+5. 在工具里自己拼接 https:// 前缀
+   → target 可能已经是 DSN 或本地路径，拼了就废。先判断有没有 "://" 或盘符。
+
+6. 工具里再起一个常驻子进程且不退出
+   → 超时时会被 taskkill /T 连带杀掉（这是设计行为，不是 bug）。
+
+7. 用 target 直接当文件名
+   → DSN 里含 : / @，Windows 下非法。要落盘就用 slug 思路或写到 project-dir 下固定名。
+
+
+======================================================================
+十、可选扩展 A：Skill（进程内技能）
+======================================================================
+只有当你要复用平台内部能力（AI 调用、子页面、跨步内存）时才需要 Skill。
+默认发行版只带一个 phase3 示例技能；你新建其它目录后重启即可被发现（热插拔）。
+
+    from core.skill.base_skill import BaseSkill
+    import threading
+
+    class MySkill(BaseSkill):
+        name = "my_skill"                 # 界面上显示的名字
+        description = "一句话说明"
+        category = "custom"
+
+        def execute(self, **kwargs):
+            host = self.current_host or "unknown"
+            self.log_start(host)          # 必须：开启本次运行日志
+            threading.Thread(target=self._run, args=(host, kwargs), daemon=True).start()
+            return "已启动"                # 必须立即返回，别阻塞
+
+        def _run(self, host, params):
+            try:
+                self.log_to_subpage(host, "处理中...")
+                self.log_success(host, "完成")     # 必须：终态
+            except Exception as e:
+                self.log_failed(host, str(e))      # 必须：终态
+
+    规则（违反会导致 L2 永远等不到"完成"）：
+        · execute() 第一件事 log_start，最后一定 log_success 或 log_failed
+        · execute() 里不能做耗时操作，逻辑放线程
+        · 用 log_to_subpage 输出，别直接操作控件
+        · 不支持 "__WAIT__" 交互（L2 场景下会直接判失败）
+
+    已知限制：Skill 实例是**单例**（每个类只创建一个），
+    _log_buffer 等状态是实例级，因此同一个 Skill 不能被多个 target 并发执行。
+    需要并发时请用工具（子进程），或在 Skill 内自行加锁。
+
+
+======================================================================
+十一、可选扩展 B：L3 手动决策面板
+======================================================================
+L3 的定位是"人来决定下一步做什么"，不强求自动化。
+
+    面板：ui/phase3_task_panel.py
+    选中一个 category == "phase3" 的 Skill，输入需求，点发送。
+    Skill 里拿到的参数：
+        user_input / app / log_fn / host / round_num / phase3_manager / task_name
+
+    可用的管理能力（app.phase3_manager）：
+        append_chat_log(task, role, content)     落盘对话（实时 fsync）
+        load_chat_log(task)                      读历史
+        get_linked_task_info(task)               拿到关联 L2 任务的 host/round/panel
+        get_round_summary_text(task, round)      读上一轮的执行摘要（喂给模型）
+        request_death(task)                      标记终止
+
+    ★ 手动触发是**设计选择**：自动连跑意味着没有人对"下一步"负责。
+      不要为了"全自动"去掉这一环。
+
+
+======================================================================
+十二、验收：什么叫"接好了"
+======================================================================
+把新工具放进 external_tools/，重启，然后在不修改任何平台代码的前提下：
+
+    □ L2 面板能添加它
+    □ 填的参数确实被工具收到（看界面上的 ⚙️ 参数 行）
+    □ 实时日志在"程序运行情况"里滚动
+    □ 步骤结束后 round_N.json 里有它的结果
+    □ 下一步能用 inherit_from 选到它（结果可继承）
+    □ 失败时该步标红但整条链不崩
+
+六条全绿 = 接入正确。任何一条需要改 core/ 或 phases/，说明契约有缺口，请先反馈。

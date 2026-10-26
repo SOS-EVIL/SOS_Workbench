@@ -1,0 +1,138 @@
+SOS_Workbench 0.1.0 二级技能规范（L2 步骤链中的技能调用）
+
+实例文件：skills/phase3/chat_bot.py
+平台实现：phases/phase2.py           Phase2Freedom._run_skill
+          core/skill/base_skill.py   生命周期与日志
+          core/skill/skill_toolbox.py 技能可调用的宿主能力
+
+适用范围：
+    本文件规定 category != "phase3" 的技能如何被二级步骤链调用。
+    涉及父子嵌套（blocking_mode）的规则见 递归标准.txt。
+
+
+======================================================================
+1. 调用链
+======================================================================
+    L2 面板点「开始」
+      → phase2.run_task
+        → 线程 _execute_tool_chain，逐步骤执行
+          → 步骤 type == "skill"
+            → _run_skill
+              → skill.execute(**params)        立即返回
+              → 轮询 latest/{slug}/round_N/{技能}_{序号}.json
+              → 读到 status in (success, failed) 即认为该步结束
+
+    技能不通过返回值报告完成，而是通过"写终态快照"。
+    这是本层最容易踩错的地方：漏写终态 = 父任务一直等。
+
+
+======================================================================
+2. 必须实现的成员
+======================================================================
+    name          str   唯一标识，出现在编排面板的工具下拉框中
+    description   str   一句话说明
+    category      str   分类；"phase3" 表示三级技能（另见递归标准）
+
+    execute(self, **kwargs) -> str
+        必须立即返回，实际工作在后台线程执行。
+
+    kwargs 里可能出现的键：
+        inherit_data    上游结果对象（success/duration/output/output_lines/result）或 inherit_file 内容
+        target          步骤参数里的目标（若有）
+        其它键          就是步骤参数 JSON 里的键，原样透传
+
+
+======================================================================
+3. 生命周期（强制）
+======================================================================
+    execute() 第一行      self.log_start(host)
+    运行中               self.log_to_subpage(host, msg)
+    终态（必须二选一）     self.log_success(host, msg) / self.log_failed(host, msg)
+
+    · log_start 会清空本次缓冲区并写入 running 快照
+    · log_success / log_failed 会写入全量日志并把状态置为终态
+    · 平台靠终态判断该步是否结束；漏写会导致该步一直等待直到超时
+
+
+======================================================================
+4. 异步执行（强制）
+======================================================================
+    execute() 不得做耗时操作，否则会占住编排线程。
+    正确写法：
+
+        threading.Thread(target=self._run, args=(host, kwargs), daemon=True).start()
+        return "已启动"
+
+    错误写法：在 execute() 里直接发网络请求 / 读大文件 / sleep。
+
+
+======================================================================
+5. 日志
+======================================================================
+    self.log_to_subpage(host, msg)
+        同时写到目标面板与结构化日志，是唯一推荐的输出方式。
+        不要直接操作 Tk 控件。
+
+    日志行不需要自己加时间戳，平台会补。
+
+
+======================================================================
+6. 返回值与失败
+======================================================================
+    返回值只作展示，不决定成败。
+    成败由 log_success / log_failed 决定。
+
+    异常必须写 log_failed 并记录原因，不得静默吞掉：
+
+        except Exception as e:
+            self.log_failed(host, str(e))
+
+
+======================================================================
+7. 模板（复制即用）
+======================================================================
+    import threading
+    from core.skill.base_skill import BaseSkill
+
+    class MySkill(BaseSkill):
+        name = "my_skill"
+        description = "一句话说明"
+        category = "custom"
+
+        def execute(self, **kwargs):
+            host = self.current_host or "unknown"
+            self.log_start(host)
+            threading.Thread(target=self._run, args=(host, kwargs), daemon=True).start()
+            return "已启动"
+
+        def _run(self, host, params):
+            try:
+                inherit = params.get("inherit_data")
+                self.log_to_subpage(host, f"收到继承数据：{type(inherit).__name__}")
+                self.log_to_subpage(host, "处理中...")
+                self.log_success(host, "完成")
+            except Exception as e:
+                self.log_failed(host, str(e))
+
+    保存到 skills/ 下任意子目录（如 skills/custom/my_skill.py），重启后自动发现。
+    目录已存在时会自动补齐 __init__.py；平台不会凭空创建技能目录。
+
+
+======================================================================
+8. 自检清单
+======================================================================
+    □ 继承 BaseSkill，且 name / description / category 已填
+    □ execute() 第一行 log_start(host)
+    □ execute() 立即返回，耗时逻辑在线程里
+    □ 所有路径（成功/失败）都会调用 log_success 或 log_failed
+    □ 日志一律走 log_to_subpage，不碰控件
+    □ 不返回 "__WAIT__"（L2 场景下会被判为失败）
+
+
+======================================================================
+9. 已知限制
+======================================================================
+    · 技能实例是单例：同一个技能类只创建一个实例，
+      _log_buffer / current_host 等是实例级状态，因此不能被多个目标并发执行。
+      需要并发时请改用工具（子进程）。
+    · 平台不校验技能目录结构，只按 skills/<分类>/*.py 扫描。
